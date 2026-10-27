@@ -1,8 +1,9 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, ModelUsage, Register } from 'claude-code'
 
 const MODEL = 'haiku'
 const SEND_CLEAN = 'Send clean'
 const SEND_ORIGINAL = 'Send my original'
+const HEADER = 'Intent guard'
 
 const CHECK_SYSTEM = `You review a prompt a person is about to send to Claude Code, a coding assistant.
 English is not their first language. They may type or dictate by voice, mix in another language,
@@ -52,13 +53,35 @@ const KEEP_MS = 7 * 24 * 60 * 60 * 1000
 
 type Saved = { at: number; folder: string; original: string; sent: string }
 
+// Off stays off in every session until turned on again.
+const ENABLED_KEY = 'enabled'
+const OFF_STATUS = 'intent-guard: off'
+
+// replace: Claude gets only the clean prompt. attach: the person's words stay; the clean one rides as context.
+const MODE_KEY = 'mode'
+type Mode = 'replace' | 'attach'
+
+// $.model.complete is not in the session's own cost total, so the mod counts its calls itself.
+const USAGE_KEY = 'usage'
+type Spent = { since: number; calls: number; input: number; output: number }
+// Claude Haiku 5.5 list price, dollars per million tokens (prompts up to 100K tokens).
+const PRICE_IN = 0.1
+const PRICE_OUT = 0.5
+
+const ATTACH_NOTE =
+  'intent-guard: English is not the person\'s first language. They checked their prompt above and approved ' +
+  'this clear English version of it. Where the two differ, follow this version:'
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
-      description: 'Show or delete the originals of prompts intent-guard rewrote: last [n] | clear',
+      description: 'Turn intent-guard on or off, pick its mode, see its cost, or show your originals',
+      argumentHint: 'status | on | off | mode [replace|attach] | last [n] | clear',
+      immediate: true,
     })
     await recentHistory($).catch(() => [])
+    if (!(await isEnabled($))) $.ui.status(OFF_STATUS)
     return next(e)
   })
 
@@ -66,6 +89,10 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     if (e.command || e.isMeta || !PERSON_ORIGINS.has(e.origin.kind)) return next(e)
+    if (!(await isEnabled($))) {
+      $.ui.status(OFF_STATUS)
+      return next(e)
+    }
     if (e.text.trim().split(/\s+/).length <= TINY_REPLY_WORDS) return next(e)
 
     $.ui.status('intent-guard: checking…')
@@ -75,6 +102,9 @@ export const register: Register = on => {
     if (clean === undefined) return next(e)
 
     await save($, e.text, clean).catch(() => undefined)
+    if ((await currentMode($)) === 'attach') {
+      return next({ ...e, context: [...(e.context ?? []), `${ATTACH_NOTE}\n\n${clean}`] })
+    }
     return next({ ...e, text: clean })
   })
 }
@@ -90,6 +120,7 @@ async function clarify($: EngineInterface, text: string): Promise<string | undef
     effort: 'low',
     timeoutMs: TIMEOUT_MS,
   })
+  await addUsage($, check.usage).catch(() => undefined)
   if (!check.isAnswered) return undefined
 
   const verdict = parseVerdict(check.text)
@@ -97,7 +128,7 @@ async function clarify($: EngineInterface, text: string): Promise<string | undef
 
   const answers: string[] = []
   for (const q of verdict.questions) {
-    answers.push(`${q.question} ${await $.ui.ask(q.question, { options: q.options, header: 'Intent guard' })}`)
+    answers.push(`${q.question} ${await $.ui.ask(q.question, { options: q.options, header: HEADER })}`)
   }
 
   const rewrite = await $.model.complete({
@@ -107,16 +138,43 @@ async function clarify($: EngineInterface, text: string): Promise<string | undef
     maxTokens: 2000,
     timeoutMs: TIMEOUT_MS,
   })
+  await addUsage($, rewrite.usage).catch(() => undefined)
   if (!rewrite.isAnswered || rewrite.text.trim() === '') return undefined
   const clean = rewrite.text.trim()
 
   const choice = await $.ui.ask(`Here is what I think you mean:\n\n${clean}\n\nWhich version should Claude get?`, {
     options: [SEND_CLEAN, SEND_ORIGINAL],
-    header: 'Intent guard',
+    header: HEADER,
   })
   if (choice === SEND_CLEAN) return clean
   if (choice === SEND_ORIGINAL || choice.trim() === '') return undefined
   return `${clean}\n\nNote from me: ${choice.trim()}`
+}
+
+async function isEnabled($: EngineInterface): Promise<boolean> {
+  return (await $.store.get(ENABLED_KEY).catch(() => undefined)) !== false
+}
+
+async function currentMode($: EngineInterface): Promise<Mode> {
+  return (await $.store.get(MODE_KEY).catch(() => undefined)) === 'attach' ? 'attach' : 'replace'
+}
+
+async function spent($: EngineInterface): Promise<Spent> {
+  const stored = (await $.store.get(USAGE_KEY)) as Partial<Spent> | undefined
+  if (typeof stored?.since === 'number') {
+    return { since: stored.since, calls: stored.calls ?? 0, input: stored.input ?? 0, output: stored.output ?? 0 }
+  }
+  return { since: await $.clock.now(), calls: 0, input: 0, output: 0 }
+}
+
+async function addUsage($: EngineInterface, usage: ModelUsage): Promise<void> {
+  const s = await spent($)
+  await $.store.set(USAGE_KEY, {
+    ...s,
+    calls: s.calls + 1,
+    input: s.input + usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
+    output: s.output + usage.output_tokens,
+  })
 }
 
 // Saved originals from the last 7 days; older ones are deleted on every read.
@@ -136,7 +194,35 @@ async function save($: EngineInterface, original: string, sent: string): Promise
 }
 
 async function runCommand($: EngineInterface, args: string): Promise<string> {
-  const [action = '', count = ''] = args.trim().split(/\s+/)
+  const [action = '', value = ''] = args.trim().split(/\s+/)
+
+  if (action === 'on' || action === 'off') {
+    await $.store.set(ENABLED_KEY, action === 'on')
+    $.ui.status(action === 'on' ? undefined : OFF_STATUS)
+    return action === 'on'
+      ? 'intent-guard: on. Your prompts are checked again, in every session.'
+      : 'intent-guard: off in every session until you type /intent-guard on.'
+  }
+
+  if (action === 'mode') {
+    if (value === 'replace' || value === 'attach') await $.store.set(MODE_KEY, value)
+    else if (value !== '') return 'intent-guard: the mode is replace or attach.'
+    return (await currentMode($)) === 'attach'
+      ? 'intent-guard mode: attach. Your words stay in the chat; Claude also gets the clean version as a hidden note.'
+      : 'intent-guard mode: replace. Claude gets only the clean version; /intent-guard last shows your words.'
+  }
+
+  if (action === 'status') {
+    const s = await spent($)
+    const dollars = (s.input * PRICE_IN + s.output * PRICE_OUT) / 1_000_000
+    return [
+      `intent-guard: ${(await isEnabled($)) ? 'on' : 'off'} · mode ${await currentMode($)}`,
+      `Since ${new Date(s.since).toISOString().slice(0, 10)}: ${s.calls} AI call${s.calls === 1 ? '' : 's'}, ` +
+        `${s.input.toLocaleString('en-US')} input + ${s.output.toLocaleString('en-US')} output tokens, ` +
+        `about $${dollars.toFixed(4)} at Claude Haiku 5.5 list price.`,
+      "These calls are not in Claude Code's own usage total.",
+    ].join('\n')
+  }
 
   if (action === 'clear') {
     const n = (await recentHistory($)).length
@@ -147,7 +233,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
   if (action === 'last') {
     const history = await recentHistory($)
     if (history.length === 0) return 'intent-guard: nothing saved in the last 7 days.'
-    const n = Math.min(Math.max(Number.parseInt(count, 10) || 1, 1), 20)
+    const n = Math.min(Math.max(Number.parseInt(value, 10) || 1, 1), 20)
     return history
       .slice(-n)
       .reverse()
@@ -159,7 +245,16 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       .join('\n\n────────\n\n')
   }
 
-  return 'intent-guard commands:\n  /intent-guard last [n]  your original next to the clean version sent (newest first, up to 20)\n  /intent-guard clear     delete every saved original\nSaved originals are deleted after 7 days.'
+  return [
+    'intent-guard commands:',
+    '  /intent-guard status                 on or off, mode, and what its AI calls cost so far',
+    '  /intent-guard on | off               turn checking on or off in every session',
+    '  /intent-guard mode [replace|attach]  replace: Claude gets only the clean prompt',
+    '                                       attach: your words stay; Claude also gets the clean one',
+    '  /intent-guard last [n]               your original next to the clean version (newest first, up to 20)',
+    '  /intent-guard clear                  delete every saved original',
+    'Saved originals are deleted after 7 days.',
+  ].join('\n')
 }
 
 async function lastAssistantText($: EngineInterface): Promise<string> {

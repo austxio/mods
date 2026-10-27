@@ -290,3 +290,86 @@ test('/intent-guard clear deletes every saved original', async ($, on) => {
   expect(cleared.text).toBe('intent-guard: deleted 1 saved original.')
   expect(shown.text).toBe('intent-guard: nothing saved in the last 7 days.')
 })
+
+test('/intent-guard off lets prompts through unchecked until /intent-guard on', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  const calls = answerModel(on, '{"clear": true}')
+  const statuses: (string | undefined)[] = []
+  on('ui.status', (_, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  const sent = enter(on)
+
+  const off = await $.command.run(command('off'))
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+  expect(calls).toEqual([])
+  expect(sent).toEqual([MESSY])
+  expect(statuses).toContain('intent-guard: off')
+  expect(off.text).toContain('off in every session')
+
+  await $.command.run(command('on'))
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+  expect(calls).toEqual(['check'])
+})
+
+test('off is remembered for new sessions and shown in the status line', async ($, on) => {
+  mock.store(on, { enabled: false })
+  on('command.register', () => ({ value: { command: 'intent-guard' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  const statuses: (string | undefined)[] = []
+  on('ui.status', (_, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  mock.clock(on)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  expect(statuses).toEqual(['intent-guard: off'])
+})
+
+test('attach mode keeps the words as typed and gives Claude the clean prompt as context', async ($, on) => {
+  mock.store(on, { mode: 'attach' })
+  mock.clock(on)
+  answerModel(on, '{"clear": false, "questions": []}')
+  answerDialog(on, ['Send clean'])
+  const seen: { text: string; context?: readonly string[] }[] = []
+  on('prompt.submit', (_, e) => {
+    seen.push({ text: e.text, context: e.context })
+    return { text: e.text }
+  })
+
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+
+  expect(seen[0]?.text).toBe(MESSY)
+  expect(seen[0]?.context?.[0]).toContain(CLEAN)
+})
+
+test('/intent-guard mode switches between replace and attach', async ($, on) => {
+  mock.store(on)
+
+  const before = await $.command.run(command('mode'))
+  const attach = await $.command.run(command('mode attach'))
+  const bad = await $.command.run(command('mode sideways'))
+
+  expect(before.text).toContain('mode: replace')
+  expect(attach.text).toContain('mode: attach')
+  expect(bad.text).toBe('intent-guard: the mode is replace or attach.')
+})
+
+test('/intent-guard status adds up the tokens of every AI call and estimates the cost', async ($, on) => {
+  mock.store(on)
+  mock.clock(on, { now: Date.UTC(2026, 9, 27) })
+  answerModel(on, '{"clear": false, "questions": []}')
+  answerDialog(on, ['Send clean'])
+  enter(on)
+
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+  const status = await $.command.run(command('status'))
+
+  // Two calls of 10 input + 10 output tokens: (20 × 0.10 + 20 × 0.50) / 1,000,000 dollars.
+  expect(status.text).toContain('intent-guard: on · mode replace')
+  expect(status.text).toContain('Since 2026-10-27: 2 AI calls, 20 input + 20 output tokens, about $0.0000')
+})
