@@ -1,0 +1,1 @@
+{ "name": "intent-guard", "version": "0.1.0", "description": "Checks each prompt you type or speak; when the goal is unclear or not in English, asks a few questions and offers a clean English prompt to send instead" }

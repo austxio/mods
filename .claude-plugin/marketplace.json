@@ -1,0 +1,5 @@
+{
+  "name": "austxio-mods",
+  "owner": { "name": "austxio" },
+  "plugins": [{ "name": "intent-guard", "source": "./plugins/intent-guard" }]
+}
