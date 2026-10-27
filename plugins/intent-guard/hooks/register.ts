@@ -40,13 +40,42 @@ type Question = { question: string; options: string[] }
 // Only what the person typed or dictated is checked; notifications, loops and other sessions pass.
 const PERSON_ORIGINS = new Set(['composer', 'bridge'])
 
+// A slow API must not hold the prompt: past this, the original is sent.
+const TIMEOUT_MS = 15000
+
+// Replies this short (yes, ok, 2, do it) answer Claude's last message; checking them costs a call for nothing.
+const TINY_REPLY_WORDS = 3
+
+const COMMAND = 'intent-guard'
+const HISTORY_KEY = 'history'
+const KEEP_MS = 7 * 24 * 60 * 60 * 1000
+
+type Saved = { at: number; folder: string; original: string; sent: string }
+
 export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: COMMAND,
+      description: 'Show or delete the originals of prompts intent-guard rewrote: last [n] | clear',
+    })
+    await recentHistory($).catch(() => [])
+    return next(e)
+  })
+
+  on('command.run', { command: COMMAND }, async ($, e) => ({ text: await runCommand($, e.args) }))
+
   on('prompt.submit', async ($, e, next) => {
     if (e.command || e.isMeta || !PERSON_ORIGINS.has(e.origin.kind)) return next(e)
+    if (e.text.trim().split(/\s+/).length <= TINY_REPLY_WORDS) return next(e)
 
-    const clean = await clarify($, e.text).catch(() => undefined)
+    $.ui.status('intent-guard: checking…')
+    const clean = await clarify($, e.text)
+      .catch(() => undefined)
+      .finally(() => $.ui.status(undefined))
+    if (clean === undefined) return next(e)
 
-    return next(clean === undefined ? e : { ...e, text: clean })
+    await save($, e.text, clean).catch(() => undefined)
+    return next({ ...e, text: clean })
   })
 }
 
@@ -59,6 +88,7 @@ async function clarify($: EngineInterface, text: string): Promise<string | undef
     prompt: `<previous_assistant_message>\n${previous}\n</previous_assistant_message>\n<prompt>\n${text}\n</prompt>`,
     maxTokens: 800,
     effort: 'low',
+    timeoutMs: TIMEOUT_MS,
   })
   if (!check.isAnswered) return undefined
 
@@ -75,6 +105,7 @@ async function clarify($: EngineInterface, text: string): Promise<string | undef
     system: REWRITE_SYSTEM,
     prompt: `<prompt>\n${text}\n</prompt>\n<answers>\n${answers.join('\n')}\n</answers>`,
     maxTokens: 2000,
+    timeoutMs: TIMEOUT_MS,
   })
   if (!rewrite.isAnswered || rewrite.text.trim() === '') return undefined
   const clean = rewrite.text.trim()
@@ -84,8 +115,51 @@ async function clarify($: EngineInterface, text: string): Promise<string | undef
     header: 'Intent guard',
   })
   if (choice === SEND_CLEAN) return clean
-  if (choice === SEND_ORIGINAL) return undefined
-  return `${clean}\n\nNote from me: ${choice}`
+  if (choice === SEND_ORIGINAL || choice.trim() === '') return undefined
+  return `${clean}\n\nNote from me: ${choice.trim()}`
+}
+
+// Saved originals from the last 7 days; older ones are deleted on every read.
+async function recentHistory($: EngineInterface): Promise<Saved[]> {
+  const stored = await $.store.get(HISTORY_KEY)
+  const all = Array.isArray(stored) ? (stored as Saved[]) : []
+  const cutoff = (await $.clock.now()) - KEEP_MS
+  const kept = all.filter(s => s.at >= cutoff)
+  if (kept.length !== all.length) await $.store.set(HISTORY_KEY, kept)
+  return kept
+}
+
+async function save($: EngineInterface, original: string, sent: string): Promise<void> {
+  const folder = await $.session.root().catch(() => '')
+  const entry: Saved = { at: await $.clock.now(), folder, original, sent }
+  await $.store.set(HISTORY_KEY, [...(await recentHistory($)), entry])
+}
+
+async function runCommand($: EngineInterface, args: string): Promise<string> {
+  const [action = '', count = ''] = args.trim().split(/\s+/)
+
+  if (action === 'clear') {
+    const n = (await recentHistory($)).length
+    await $.store.set(HISTORY_KEY, [])
+    return `intent-guard: deleted ${n} saved original${n === 1 ? '' : 's'}.`
+  }
+
+  if (action === 'last') {
+    const history = await recentHistory($)
+    if (history.length === 0) return 'intent-guard: nothing saved in the last 7 days.'
+    const n = Math.min(Math.max(Number.parseInt(count, 10) || 1, 1), 20)
+    return history
+      .slice(-n)
+      .reverse()
+      .map(
+        (s, i) =>
+          `#${i + 1} · ${new Date(s.at).toISOString().slice(0, 16).replace('T', ' ')} UTC · ${s.folder}\n` +
+          `You wrote:\n${s.original}\n\nSent to Claude:\n${s.sent}`,
+      )
+      .join('\n\n────────\n\n')
+  }
+
+  return 'intent-guard commands:\n  /intent-guard last [n]  your original next to the clean version sent (newest first, up to 20)\n  /intent-guard clear     delete every saved original\nSaved originals are deleted after 7 days.'
 }
 
 async function lastAssistantText($: EngineInterface): Promise<string> {

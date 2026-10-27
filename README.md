@@ -12,6 +12,20 @@ from your plan; an unclear one uses two.
 
 Made for people who work with Claude in English as a second language, typed or by voice.
 
+Short replies of three words or fewer (yes, ok, 2, do it) skip the check. While it checks, the line
+`intent-guard: checking…` shows under the prompt; if the AI does not answer within 15 seconds, your
+original is sent.
+
+### Your original words
+
+When a prompt is rewritten, your original is saved next to the clean version, in the mod's own file in
+your Claude Code settings folder. Saved originals are deleted automatically after 7 days.
+
+```
+/intent-guard last [n]   your original next to the clean version sent (newest first, up to 20)
+/intent-guard clear      delete every saved original now
+```
+
 ### Install
 
 At the prompt of a Claude Code terminal session:

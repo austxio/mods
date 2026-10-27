@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
 type On = Parameters<TestBody>[1]
@@ -145,7 +145,7 @@ test('prompts that are not typed or spoken by the person are not checked', async
   expect(sent).toEqual([MESSY])
 })
 
-test("the check reads Claude's last reply, so a short answer like \"yes\" is judged in context", async ($, on) => {
+test("the check reads Claude's last reply, so a short answer is judged in context", async ($, on) => {
   on('session.messages', () => ({
     value: [{ role: 'assistant', text: 'Should I also update the tests?', toolUses: [] }],
   }))
@@ -156,8 +156,137 @@ test("the check reads Claude's last reply, so a short answer like \"yes\" is jud
   })
   const sent = enter(on)
 
-  await $.prompt.submit({ text: 'yes', ...PERSON })
+  await $.prompt.submit({ text: 'yes update them too', ...PERSON })
 
   expect(prompts[0]).toContain('Should I also update the tests?')
-  expect(sent).toEqual(['yes'])
+  expect(sent).toEqual(['yes update them too'])
+})
+
+const DAY = 24 * 60 * 60 * 1000
+
+function command(args: string) {
+  return {
+    command: 'intent-guard',
+    args,
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 120 },
+  } as const
+}
+
+test('both model calls are given a 15 second time limit', async ($, on) => {
+  const limits: (number | undefined)[] = []
+  on('model.complete', (_, e) => {
+    limits.push(e.timeoutMs)
+    const text = e.system?.includes('Reply with JSON only') ? '{"clear": false, "questions": []}' : CLEAN
+    return { value: { isAnswered: true, text, usage: USAGE } }
+  })
+  answerDialog(on, ['Send clean'])
+  enter(on)
+
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+
+  expect(limits).toEqual([15000, 15000])
+})
+
+test('a check that runs out of time sends the original', async ($, on) => {
+  on('model.complete', () => ({ value: { isAnswered: false, reason: 'aborted', usage: USAGE } }))
+  const sent = enter(on)
+
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+
+  expect(sent).toEqual([MESSY])
+})
+
+test('tiny replies skip the model entirely', async ($, on) => {
+  const calls = answerModel(on, '{"clear": false, "questions": []}')
+  const sent = enter(on)
+
+  for (const text of ['yes', 'ok', '2', 'do it now']) {
+    await $.prompt.submit({ text, ...PERSON })
+  }
+
+  expect(calls).toEqual([])
+  expect(sent).toEqual(['yes', 'ok', '2', 'do it now'])
+})
+
+test('an empty answer under "Other" sends the original, not a blank note', async ($, on) => {
+  answerModel(on, '{"clear": false, "questions": []}')
+  answerDialog(on, ['  '])
+  const sent = enter(on)
+
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+
+  expect(sent).toEqual([MESSY])
+})
+
+test('a status line shows while checking and is cleared after', async ($, on) => {
+  const statuses: (string | undefined)[] = []
+  on('ui.status', (_, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  answerModel(on, '{"clear": true}')
+  enter(on)
+
+  await $.prompt.submit({ text: 'Run the tests in src/auth', ...PERSON })
+
+  expect(statuses).toEqual(['intent-guard: checking…', undefined])
+})
+
+test('a rewritten prompt is saved with the original, and /intent-guard last shows both', async ($, on) => {
+  mock.store(on)
+  mock.clock(on, { now: Date.UTC(2026, 9, 27, 8, 46) })
+  on('session.root', () => ({ value: '/home/me/work/app' }))
+  answerModel(on, '{"clear": false, "questions": []}')
+  answerDialog(on, ['Send clean'])
+  enter(on)
+
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+  const shown = await $.command.run(command('last'))
+
+  expect(shown.text).toContain(MESSY)
+  expect(shown.text).toContain(CLEAN)
+  expect(shown.text).toContain('/home/me/work/app')
+  expect(shown.context).toBeUndefined()
+})
+
+test('prompts sent as written are not saved', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  answerModel(on, '{"clear": false, "questions": []}')
+  answerDialog(on, ['Send my original'])
+  enter(on)
+
+  await $.prompt.submit({ text: MESSY, ...PERSON })
+  const shown = await $.command.run(command('last'))
+
+  expect(shown.text).toBe('intent-guard: nothing saved in the last 7 days.')
+})
+
+test('saved originals older than 7 days are deleted', async ($, on) => {
+  const now = Date.UTC(2026, 9, 27)
+  mock.store(on, {
+    history: [
+      { at: now - 8 * DAY, folder: '/old', original: 'old words', sent: 'old clean' },
+      { at: now - 1 * DAY, folder: '/new', original: 'new words', sent: 'new clean' },
+    ],
+  })
+  mock.clock(on, { now })
+
+  const shown = await $.command.run(command('last 5'))
+
+  expect(shown.text).toContain('new words')
+  expect(shown.text).not.toContain('old words')
+})
+
+test('/intent-guard clear deletes every saved original', async ($, on) => {
+  const now = Date.UTC(2026, 9, 27)
+  mock.store(on, { history: [{ at: now, folder: '/a', original: 'words', sent: 'clean' }] })
+  mock.clock(on, { now })
+
+  const cleared = await $.command.run(command('clear'))
+  const shown = await $.command.run(command('last'))
+
+  expect(cleared.text).toBe('intent-guard: deleted 1 saved original.')
+  expect(shown.text).toBe('intent-guard: nothing saved in the last 7 days.')
 })
