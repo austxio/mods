@@ -14,12 +14,24 @@ Made for people who work with Claude in English as a second language, typed or b
 
 Short replies of three words or fewer (yes, ok, 2, do it) skip the check. While it checks, the line
 `intent-guard: checking…` shows under the prompt; if the AI does not answer within 15 seconds, your
-original is sent.
+original is sent. A dialog nobody answers for 10 minutes also lets your original through; the
+dialog stays on screen and a late answer is ignored. When the check or the rewrite fails, a short notice says
+your original was sent, along with any answers you already gave.
+
+A side agent's note you forward is sent word for word. Only the words you add after it are checked and
+rewritten, and a note with no words of yours goes straight through.
+
+The rewrite only has `Why`, `Guardrails` and `Done when` lines when your words or answers state them. Under
+**Other** in the last dialog you can add a note or paste your edited copy of the proposal, which then replaces
+it.
+
+The AI cannot see attached images. It is told they are there and keeps each `[Image #N]`.
 
 ### Turn it off, pick a mode, see the cost
 
 ```
-/intent-guard status                 on or off, mode, and what its AI calls cost so far
+/intent-guard status                 on or off, mode, its AI cost, and what happened to prompts lately
+/intent-guard log [n]                what happened to each prompt, without its words (default 20)
 /intent-guard on | off               off stays off in every session until you turn it on
 /intent-guard mode [replace|attach]  replace (default): Claude gets only the clean prompt
                                      attach: your words stay in the chat; Claude also gets the
@@ -34,7 +46,8 @@ total.
 ### Your original words
 
 When a prompt is rewritten, your original is saved next to the clean version, in the mod's own file in
-your Claude Code settings folder. Saved originals are deleted automatically after 7 days.
+your Claude Code settings folder. Saved originals and the log are deleted automatically after 7 days.
+Each session keeps its own counts and originals, so sessions running at once do not overwrite each other.
 
 ```
 /intent-guard last [n]   your original next to the clean version sent (newest first, up to 20)
